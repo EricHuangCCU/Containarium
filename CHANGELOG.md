@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Anonymous-box claim (#2199): `ClaimAnonymousBox` redeems the single-use
+  token minted into every anonymous box (`/etc/containarium/claim-url`) and
+  binds the box to a tenant — TTL cleared, egress guard lifted, the tenant's
+  keys added, owner set; the box keeps its name and login and stays reachable
+  through the door. `containarium claim` (inside the box) prints the claim
+  URL or token (`--json`); `containarium anon claim <token> --tenant <u>`
+  redeems it as an admin; daemon flag `--anon-claim-url-base`. A second
+  redeem is AlreadyExists, an expired token FailedPrecondition, a bad one
+  PermissionDenied.
+
+- `containarium sentinel anon-door-plugin` (#2198) — the sshpiperd plugin
+  behind `ssh new.<domain>`: on public-key auth it asks the anon-pool daemon
+  for the key's box (`POST /v1/anon/boxes:ensure`, signed with the sentinel's
+  existing identity) and pipes the session there with the usual upstream key;
+  non-key auth is refused. Terraform: `anon_door_addr` + `anon_daemon_url`
+  install a second `sshpiper-anon.service` (chain: audit → door → failtoban)
+  through the same live-metadata reconcile as `sshpiper.service`; empty =
+  unit removed.
+
 - `AnonymousBoxService` (#2197) — the daemon side of the `ssh new.<domain>`
   door: `EnsureAnonymousBox` resolves or creates an Incus **VM** per SSH-key
   fingerprint (fixed 2 vCPU / 4 GB / 20 GB, 4 h TTL, egress limited to
