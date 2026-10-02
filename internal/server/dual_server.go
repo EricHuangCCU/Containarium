@@ -18,6 +18,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/footprintai/containarium/internal/alert"
+	"go.opentelemetry.io/otel"
+
 	"github.com/footprintai/containarium/internal/anonbox"
 	"github.com/footprintai/containarium/internal/app"
 	"github.com/footprintai/containarium/internal/audit"
@@ -66,6 +68,18 @@ import (
 )
 
 // DualServerConfig holds configuration for the dual server
+// AnonDoorOptions are the daemon flags behind the anonymous-box
+// guardrails (#2200). Rates are creates per 10 minutes, the unit the
+// decision on #2204 was taken in.
+type AnonDoorOptions struct {
+	MaxBoxes        int
+	KeyCreatesPer10 int
+	KeyBurst        int
+	IPCreatesPer10  int
+	IPBurst         int
+	StatePath       string
+}
+
 type DualServerConfig struct {
 	// gRPC settings
 	GRPCAddress string
@@ -87,11 +101,26 @@ type DualServerConfig struct {
 	EnableAppHosting   bool
 	PostgresConnString string
 	BaseDomain         string
+	// BridgeDNSReconcileDisabled is the off switch for the bridge raw.dnsmasq
+	// reconciler (#2188) an operator can throw without rolling back (#2232
+	// option 2). Zero value = reconciler on; set by --bridge-dns-reconcile=false.
+	BridgeDNSReconcileDisabled bool
+	// BridgeDNSCreate lets the reconciler write a record onto a bridge that
+	// has none (#2232 option 1). Default false: a host without a record is
+	// left alone unless this run installed core-caddy.
+	BridgeDNSCreate bool
+
 	// AnonClaimURLBase is prefixed to anonymous-box claim tokens as
 	// "<base>?token=…" in the guest's claim-url file (#2199), e.g.
 	// https://<cloud-domain>/claim. Empty = the bare token is written.
 	AnonClaimURLBase string
-	CaddyAdminURL    string
+	// AnonReminderWebhook receives one POST per opt-in expiry reminder
+	// (#2206) — the control plane emails the user; empty = reminders off.
+	AnonReminderWebhook string
+	// AnonDoor tunes the anonymous-box guardrails (#2200); zero values
+	// mean anonbox.DefaultLimits / anonbox.DefaultDoorStatePath.
+	AnonDoor      AnonDoorOptions
+	CaddyAdminURL string
 
 	// Route sync settings
 	RouteSyncInterval time.Duration // Interval for syncing routes to Caddy (default 5s)
@@ -265,6 +294,7 @@ type DualServer struct {
 	peerPool                 *PeerPool
 	autoSleepManager         *autosleep.Manager
 	ttlSweeperManager        *ttlsweeper.Manager    // ephemeral CI box auto-delete (#299)
+	anonManager              *anonbox.Manager       // anonymous-box door (#2197); nil unless CONTAINARIUM_ANON_DOOR=enable
 	sandboxServer            *SandboxServer         // set in NewDualServer when incus.New succeeds; nil otherwise (#1488)
 	sandboxTTLSweeperManager *ttlsweeper.Manager    // ephemeral sandbox auto-delete (#1488 Phase 4)
 	secretsReconciler        *secretsReconciler     // Phase 4.3 Phase B-3
@@ -784,6 +814,7 @@ func NewDualServer(config *DualServerConfig) (*DualServer, error) {
 	// address on every start (#2188). Nil unless app hosting is on, a base
 	// domain is set and a core-caddy container exists on this host.
 	var bridgeDNS *bridgedns.Reconciler
+	caddyInstalledThisRun := false
 	// postgresConnString is hoisted so collaborator init (after skipAppHosting) can use it
 	postgresConnString := config.PostgresConnString
 	if config.EnableAppHosting {
@@ -829,6 +860,9 @@ func NewDualServer(config *DualServerConfig) (*DualServer, error) {
 					if err != nil {
 						log.Printf("Warning: Failed to setup Caddy: %v. Proxy features disabled.", err)
 					} else {
+						// This run installed core-caddy: the one case the
+						// bridge DNS reconciler may create the record (#2232).
+						caddyInstalledThisRun = true
 						caddyAdminURL = adminURL
 						caddyIP := coreServices.GetCaddyIP()
 						log.Printf("Caddy ready: %s", caddyIP)
@@ -869,7 +903,10 @@ func NewDualServer(config *DualServerConfig) (*DualServer, error) {
 			// so the block that writes the record is skipped and a stale address
 			// would stay forever. Built here, outside that block, so it runs on
 			// every start; its first pass repairs a stale record.
-			bridgeDNS = newBridgeDNSReconciler(config, incusClient)
+			bridgeDNS = newBridgeDNSReconciler(config, incusClient, caddyInstalledThisRun)
+			if bridgeDNS == nil && config.BridgeDNSReconcileDisabled {
+				log.Printf("[bridgedns] disabled by --bridge-dns-reconcile=false; the bridge record is not managed by this daemon")
+			}
 
 			// Setup VictoriaMetrics + Grafana if no URL provided
 			victoriaMetricsURL := config.VictoriaMetricsURL
@@ -1878,6 +1915,7 @@ skipAppHosting:
 	// over an LXC box backend: the manager needs exec + TTL capabilities and
 	// the Incus NIC ACL path for its egress guard, neither of which a K8s
 	// backend offers. Limits are the fixed defaults until #2200 adds flags.
+	var anonManager *anonbox.Manager
 	if os.Getenv("CONTAINARIUM_ANON_DOOR") == "enable" {
 		anonBoxes, ok := containerServer.BoxBackend().(anonbox.Boxes)
 		switch {
@@ -1887,18 +1925,63 @@ skipAppHosting:
 			log.Printf("AnonymousBox service disabled: no incus client for NIC ACLs")
 		default:
 			anonLimits := anonbox.DefaultLimits()
+			if o := config.AnonDoor; true {
+				if o.MaxBoxes > 0 {
+					anonLimits.MaxBoxes = o.MaxBoxes
+				}
+				if o.KeyCreatesPer10 > 0 {
+					anonLimits.PerKeyPerMinute = float64(o.KeyCreatesPer10) / 10
+				}
+				if o.KeyBurst > 0 {
+					anonLimits.PerKeyBurst = o.KeyBurst
+				}
+				if o.IPCreatesPer10 > 0 {
+					anonLimits.PerIPPerMinute = float64(o.IPCreatesPer10) / 10
+				}
+				if o.IPBurst > 0 {
+					anonLimits.PerIPBurst = o.IPBurst
+				}
+			}
+			anonStatePath := config.AnonDoor.StatePath
+			if anonStatePath == "" {
+				anonStatePath = anonbox.DefaultDoorStatePath
+			}
+			// Funnel (#2201): every step → an ANON_* event on the bus and a
+			// containarium.anon.<step>_total counter on the daemon's meter.
+			var anonFunnel anonbox.Funnel = anonbox.NopFunnel{}
+			if sink, err := newAnonFunnelSink(events.GetBus(), otel.GetMeterProvider()); err != nil {
+				log.Printf("WARNING: anonymous-box funnel metrics disabled: %v", err)
+			} else {
+				anonFunnel = sink
+			}
+			var anonReminder anonbox.ReminderSender
+			if config.AnonReminderWebhook != "" {
+				anonReminder = newAnonReminderWebhook(config.AnonReminderWebhook)
+			}
 			anonMgr := anonbox.New(anonBoxes, networkIncusClient, anonbox.Config{
-				Limits:    anonLimits,
-				NICDevice: "eth0",
-				Bridge:    "incusbr0",
+				Limits:        anonLimits,
+				Funnel:        anonFunnel,
+				Reminder:      anonReminder,
+				NICDevice:     "eth0",
+				Bridge:        "incusbr0",
+				DoorStatePath: anonStatePath,
 				// The claim secret is re-derived from the daemon's signing
 				// key per box — nothing to persist, rotates with the key.
 				ClaimSecret:  func(boxName string) string { return tokenManager.DeriveSharedSecret("anon-claim", boxName) },
 				ClaimURLBase: config.AnonClaimURLBase,
 			})
+			anonManager = anonMgr
 			anonServer := NewAnonymousBoxServer(anonMgr, anonBoxes, anonLimits)
 			anonServer.SetClaimer(anonMgr)
+			anonServer.SetDoor(anonMgr)
+			if err := anonMgr.DoorErr(); err != nil {
+				log.Printf("ERROR: %v — the anonymous door is CLOSED until `containarium anon enable` rewrites it", err)
+			}
 			pb.RegisterAnonymousBoxServiceServer(grpcServer, anonServer)
+			// Unclaimed anonymous boxes may not expose ports or routes (#2200).
+			if networkServer != nil {
+				networkServer.SetAnonGuard(AnonRouteGuard(networkIncusClient.GetLabels))
+			}
 			log.Printf("AnonymousBox service enabled (VM per key, %s vCPU / %s / %s, ttl %s)", anonLimits.CPU, anonLimits.Memory, anonLimits.Disk, anonLimits.TTL)
 		}
 	}
@@ -2446,6 +2529,7 @@ skipAppHosting:
 	}
 
 	ds := &DualServer{
+		anonManager:            anonManager,
 		config:                 config,
 		agentSkillServer:       agentSkillServer,
 		grpcServer:             grpcServer,
@@ -2759,6 +2843,11 @@ func (ds *DualServer) handleBackendSystemInfo(w http.ResponseWriter, r *http.Req
 }
 
 func (ds *DualServer) Start(ctx context.Context) error {
+	// Anonymous-box funnel (#2201): emit expired / killed events within a
+	// minute of a box disappearing.
+	if ds.anonManager != nil {
+		go anonObserveLoop(ctx, ds.anonManager, time.Minute)
+	}
 	if ds.agentSkillServer != nil {
 		ds.agentSkillServer.StartRunJournalReaper(ctx)
 	}
@@ -2782,6 +2871,7 @@ func (ds *DualServer) Start(ctx context.Context) error {
 		// GetBridgeDNSStatus (#2188): nil when app hosting is off or core-caddy
 		// is not managed by this daemon, which the RPC reports as NOT_MANAGED.
 		ds.containerServer.SetBridgeDNSReconciler(ds.bridgeDNS)
+		ds.containerServer.SetBridgeDNSDisabled(ds.config.BridgeDNSReconcileDisabled)
 		// Capability-profile identity (#681): region from --region, falling
 		// back to the pool name; self-reported class from the pool name. Both
 		// may be empty. Wired unconditionally — profiling works on a
