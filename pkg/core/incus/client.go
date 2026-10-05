@@ -472,9 +472,15 @@ type ContainerInfo struct {
 	// generated username at create time), and it's what the daemon's SSH
 	// front routes by — so callers doing SSH/install must use this, not the
 	// requested name. Empty when the daemon doesn't report it.
-	Username     string
-	State        string
-	IPAddress    string
+	Username  string
+	State     string
+	IPAddress string
+	// SSHHost is the host a client should SSH to, as computed by the
+	// daemon from its own routing config (proto Container.ssh_host): the
+	// container IP in direct mode, the sentinel's public host when routed
+	// through one. Empty when the daemon doesn't report it (local Incus,
+	// older daemons) — callers then fall back to IPAddress.
+	SSHHost      string
 	CPU          string
 	Memory       string
 	Disk         string
@@ -697,6 +703,10 @@ type ContainerMetrics struct {
 type ServerInfo struct {
 	Version       string
 	KernelVersion string
+	// CPUBudget is the daemon's tenant / core / physical CPU breakdown and
+	// admission-gate posture (#2284). Nil when the source did not report
+	// one — local Incus mode, or a daemon that predates the field.
+	CPUBudget *CPUBudget
 }
 
 // DefaultSocketPath is the Incus unix socket path used by New() and by any

@@ -319,6 +319,41 @@ func (c *Client) ListAgentSkills() (*ListAgentSkillsResponse, error) {
 	return &resp, nil
 }
 
+// AgentEngineStatusSummary is one entry of the /v1/agent-engines response.
+// JSON tags are the grpc-gateway camelCase output names; Engine/Provider/
+// Readiness/Source arrive as the proto enum's NAME string (e.g.
+// "AGENT_ENGINE_CLAUDE"), which is grpc-gateway's default enum encoding.
+type AgentEngineStatusSummary struct {
+	Engine    string   `json:"engine"`
+	Provider  string   `json:"provider"`
+	Readiness string   `json:"readiness"`
+	Reason    string   `json:"reason"`
+	Source    string   `json:"source"`
+	IsDefault bool     `json:"isDefault"`
+	SkillIDs  []string `json:"skillIds"`
+}
+
+// ListAgentEnginesResponse is the /v1/agent-engines response (#2223).
+type ListAgentEnginesResponse struct {
+	Engines  []AgentEngineStatusSummary `json:"engines"`
+	KeyOwner string                     `json:"keyOwner"`
+}
+
+// ListAgentEngines reports, for each agent engine, whether a run naming it
+// would be refused right now — the same check RunAgentSkill's refusal
+// enforces, read-only.
+func (c *Client) ListAgentEngines() (*ListAgentEnginesResponse, error) {
+	respBody, err := c.doRequest("GET", "/v1/agent-engines", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp ListAgentEnginesResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
 // RunAgentSkillRequest is the body for an agent-skill run. Snake_case tags
 // match the proto field names, which grpc-gateway accepts on input.
 // GitSource/GitRef (#1859) fetch a repo into the run's workspace before the
@@ -331,6 +366,11 @@ type RunAgentSkillRequest struct {
 	InputJSON string `json:"input_json,omitempty"`
 	GitSource string `json:"git_source,omitempty"`
 	GitRef    string `json:"git_ref,omitempty"`
+	// Engine (#2228) is the proto enum's NAME string (e.g.
+	// "AGENT_ENGINE_CODEX"), the shape protojson expects for an enum field.
+	// handleRunAgentSkill validates+normalizes the tool's lowercase "engine"
+	// argument into this shape before it ever reaches here.
+	Engine string `json:"engine,omitempty"`
 }
 
 // RunAgentSkillResponse is the result of an agent-skill run.
@@ -617,6 +657,9 @@ type VerifyBackupRequest struct {
 	ID             string            `json:"id"`
 	TargetUsername string            `json:"target_username"`
 	Connection     *PgConnectionBody `json:"connection,omitempty"`
+	// AgeIdentity decrypts an encrypted record for this one call, same
+	// contract as RestoreBackupRequest.AgeIdentity (#1831, #2295).
+	AgeIdentity string `json:"age_identity,omitempty"`
 }
 
 // VerifyBackupResponse is the result of a restore test.
@@ -2280,4 +2323,13 @@ type SystemInfo struct {
 	// whether an external SSH/deploy entrypoint exists and what host it is,
 	// instead of assuming a sentinel that may not exist. See #1011.
 	SSHIngressHost string `json:"sshIngressHost,omitempty"`
+	// CPU budget (#2284): tenant-committed, core-committed and physical
+	// cores plus the admission gate's posture, exactly as the daemon's
+	// SystemInfo carries them (enum by its proto name). CpuAdmissionMode
+	// empty or UNSPECIFIED means the daemon predates the field.
+	TotalCpus             int32   `json:"totalCpus"`
+	CommittedCpuCores     float64 `json:"committedCpuCores"`
+	CoreCommittedCpuCores float64 `json:"coreCommittedCpuCores"`
+	CpuAdmissionMode      string  `json:"cpuAdmissionMode,omitempty"`
+	CpuOvercommitFactor   float64 `json:"cpuOvercommitFactor"`
 }
