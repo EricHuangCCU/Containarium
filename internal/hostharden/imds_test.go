@@ -2,6 +2,8 @@ package hostharden
 
 import (
 	"errors"
+	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -118,6 +120,24 @@ func TestBlockMetadataFromBridge(t *testing.T) {
 		}
 	})
 
+	t.Run("checks and inserts the same rule MetadataBlockPresent looks for", func(t *testing.T) {
+		var calls []call
+		run := fakeRunner(t, &calls, map[string]result{
+			"incus network get incusbr0 ipv4.address": {out: "10.0.3.1/24\n"},
+			"iptables -C": {err: errors.New("no such rule")},
+			"iptables -I": {},
+		})
+		if _, _, err := blockMetadataFromBridge(run, "incusbr0"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := strings.Join(metadataRule("10.0.3.1/24"), " ")
+		for _, c := range calls[1:] {
+			if got := strings.Join(c.args[1:], " "); got != want {
+				t.Errorf("iptables %s used rule %q, want %q", c.args[0], got, want)
+			}
+		}
+	})
+
 	t.Run("surfaces an iptables insert failure", func(t *testing.T) {
 		var calls []call
 		run := fakeRunner(t, &calls, map[string]result{
@@ -129,4 +149,86 @@ func TestBlockMetadataFromBridge(t *testing.T) {
 			t.Fatal("expected an error")
 		}
 	})
+}
+
+// exitErr stands in for *exec.ExitError: an error that carries the process's
+// exit status.
+type exitErr int
+
+func (e exitErr) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
+func (e exitErr) ExitCode() int { return int(e) }
+
+// metadataBlockPresent reads the exit status through this method set; the
+// real runner's error must have it too.
+var _ interface{ ExitCode() int } = (*exec.ExitError)(nil)
+
+func TestMetadataBlockPresent(t *testing.T) {
+	const check = "iptables -C FORWARD -s 10.0.3.1/24 -d 169.254.169.254 -j DROP"
+	cases := []struct {
+		name        string
+		responses   map[string]result
+		wantPresent bool
+		wantErr     bool
+		wantCalls   int
+	}{
+		{
+			name: "rule present",
+			responses: map[string]result{
+				"incus network get incusbr0 ipv4.address": {out: "10.0.3.1/24\n"},
+				check: {},
+			},
+			wantPresent: true, wantCalls: 2,
+		},
+		{
+			name: "rule absent (iptables -C exits 1)",
+			responses: map[string]result{
+				"incus network get incusbr0 ipv4.address": {out: "10.0.3.1/24\n"},
+				check: {out: "iptables: Bad rule (does a matching rule exist in that chain?).", err: exitErr(1)},
+			},
+			wantCalls: 2,
+		},
+		{
+			name: "permission denied is unknown, not absent",
+			responses: map[string]result{
+				"incus network get incusbr0 ipv4.address": {out: "10.0.3.1/24\n"},
+				check: {out: "iptables: Permission denied (you must be root).", err: exitErr(4)},
+			},
+			wantErr: true, wantCalls: 2,
+		},
+		{
+			name: "missing iptables binary is unknown, not absent",
+			responses: map[string]result{
+				"incus network get incusbr0 ipv4.address": {out: "10.0.3.1/24\n"},
+				check: {err: exec.ErrNotFound},
+			},
+			wantErr: true, wantCalls: 2,
+		},
+		{
+			name: "unresolvable bridge is unknown and never reaches iptables",
+			responses: map[string]result{
+				"incus network get incusbr0 ipv4.address": {out: "none\n"},
+			},
+			wantErr: true, wantCalls: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []call
+			present, detail, err := metadataBlockPresent(fakeRunner(t, &calls, tc.responses), "incusbr0")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if present != tc.wantPresent {
+				t.Errorf("present = %v, want %v (detail %q)", present, tc.wantPresent, detail)
+			}
+			if len(calls) != tc.wantCalls {
+				t.Errorf("ran %d commands, want %d: %+v", len(calls), tc.wantCalls, calls)
+			}
+			for _, c := range calls {
+				if c.name == "iptables" && c.args[0] != "-C" {
+					t.Errorf("ran iptables %s; the probe must only check, never change", c.args[0])
+				}
+			}
+		})
+	}
 }
