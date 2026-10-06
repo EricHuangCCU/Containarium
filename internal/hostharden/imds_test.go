@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 type call struct {
@@ -161,6 +162,43 @@ func (e exitErr) ExitCode() int { return int(e) }
 // metadataBlockPresent reads the exit status through this method set; the
 // real runner's error must have it too.
 var _ interface{ ExitCode() int } = (*exec.ExitError)(nil)
+
+// TestTimeoutRunner runs real processes: the bound only matters against a
+// command that actually hangs.
+func TestTimeoutRunner(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh on this host")
+	}
+
+	t.Run("a command that finishes keeps its output and exit status", func(t *testing.T) {
+		out, err := timeoutRunner(5*time.Second)("sh", "-c", "echo no such rule; exit 1")
+		var exit interface{ ExitCode() int }
+		if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+			t.Fatalf("err = %v, want exit status 1 (metadataBlockPresent's \"absent\")", err)
+		}
+		if strings.TrimSpace(string(out)) != "no such rule" {
+			t.Errorf("out = %q", out)
+		}
+	})
+
+	t.Run("a hung command is cut off, even if a child holds its output open", func(t *testing.T) {
+		start := time.Now()
+		// The backgrounded sleep inherits stdout, so killing sh alone would
+		// leave CombinedOutput waiting for it.
+		_, err := timeoutRunner(100*time.Millisecond)("sh", "-c", "sleep 30 & sleep 30")
+		elapsed := time.Since(start)
+		if err == nil || !strings.Contains(err.Error(), "did not finish within") {
+			t.Fatalf("err = %v, want a timeout error", err)
+		}
+		var exit interface{ ExitCode() int }
+		if errors.As(err, &exit) {
+			t.Errorf("timeout error carries exit code %d; it must read as unknown, not as a verdict", exit.ExitCode())
+		}
+		if elapsed > 5*time.Second {
+			t.Errorf("returned after %v; the timeout plus probeWaitDelay should bound it to about 1s", elapsed)
+		}
+	})
+}
 
 func TestMetadataBlockPresent(t *testing.T) {
 	const check = "iptables -C FORWARD -s 10.0.3.1/24 -d 169.254.169.254 -j DROP"

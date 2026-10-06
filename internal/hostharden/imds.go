@@ -21,10 +21,12 @@
 package hostharden
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // MetadataIP is the link-local cloud-metadata address common to GCP, AWS,
@@ -44,6 +46,34 @@ type runner func(name string, args ...string) ([]byte, error)
 
 func defaultRunner(name string, args ...string) ([]byte, error) {
 	return exec.Command(name, args...).CombinedOutput() // #nosec G204 -- name/args are package-internal constants ("incus", "iptables") with a caller-supplied bridge name, never raw user input
+}
+
+// probeTimeout bounds each command MetadataBlockPresent runs. The posture
+// check runs in `doctor` and in the daemon's cloud status probe every
+// heartbeat; a hung incusd must not hang either of them (#2325 was that
+// failure for the hardware scan).
+const probeTimeout = 5 * time.Second
+
+// probeWaitDelay bounds how long a timed-out command's output pipes may stay
+// open after it is killed: a child it spawned can hold them, and
+// CombinedOutput would otherwise wait for that child too.
+const probeWaitDelay = time.Second
+
+// timeoutRunner is defaultRunner with a deadline. A command that overruns it
+// is killed and reported as an error with no exit code, which
+// metadataBlockPresent treats as "could not tell", never as "absent".
+func timeoutRunner(timeout time.Duration) runner {
+	return func(name string, args ...string) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- same callers and arguments as defaultRunner
+		cmd.WaitDelay = probeWaitDelay
+		out, err := cmd.CombinedOutput()
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return out, fmt.Errorf("%s did not finish within %s", name, timeout)
+		}
+		return out, err
+	}
 }
 
 // BridgeSubnet resolves bridge's configured IPv4 CIDR via the incus CLI
@@ -119,9 +149,10 @@ func metadataRule(subnet string) []string {
 // check, so it keeps "absent" and "could not tell" apart: present=false with
 // a nil error means `iptables -C` ran and found no such rule; a non-nil error
 // means the answer is unknown (bridge has no subnet, iptables missing, not
-// root, nftables-only host).
+// root, nftables-only host, or a command that did not finish within
+// probeTimeout).
 func MetadataBlockPresent(bridge string) (present bool, detail string, err error) {
-	return metadataBlockPresent(defaultRunner, bridge)
+	return metadataBlockPresent(timeoutRunner(probeTimeout), bridge)
 }
 
 func metadataBlockPresent(run runner, bridge string) (bool, string, error) {
